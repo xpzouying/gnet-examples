@@ -19,6 +19,7 @@ import (
 
 var res string
 
+// request 定义了http请求中的metadata数据
 type request struct {
 	proto, method string
 	path, query   string
@@ -26,6 +27,9 @@ type request struct {
 	remoteAddr    string
 }
 
+// 在这里使用了 内嵌结构体的形式。
+// *gnet.EventServer 是在gnet库中的默认结构体定义，实现了所有的 EventHandler interface接口约定，但是所有的函数都是空。
+// 我们在使用时，不需要让httpServer全部重新实现一遍EventHandler接口中的定义，只需要根据我们自己的需求重写对应的接口。
 type httpServer struct {
 	*gnet.EventServer
 }
@@ -35,6 +39,7 @@ var (
 	errMsgBytes = []byte(errMsg)
 )
 
+// TODO(zy): 查看gnet中，怎么把httpServer和httpCodec串起来了
 type httpCodec struct {
 	req request
 }
@@ -47,14 +52,14 @@ func (hc *httpCodec) Encode(c gnet.Conn, buf []byte) (out []byte, err error) {
 }
 
 func (hc *httpCodec) Decode(c gnet.Conn) (out []byte, err error) {
-	buf := c.Read()
+	buf := c.Read()  // 读出所有的http请求数据
 	c.ResetBuffer()
 
 	// process the pipeline
 	var leftover []byte
 pipeline:
 	leftover, err = parseReq(buf, &hc.req)
-	// bad thing happened
+	// bad thing happened - 错误的http请求
 	if err != nil {
 		c.SetContext(err)
 		return nil, err
@@ -62,17 +67,23 @@ pipeline:
 		// request not ready, yet
 		return
 	}
-	out = appendHandle(out, res)
+	out = appendHandle(out, res)  // 正确的响应返回给请求
 	buf = leftover
 	goto pipeline
 }
 
+// 在httpServer的定义中，我们重写了2个EventHandler中的接口。
+
+// OnInitComplete - 这个接口的重写只是为了输出启动后的日志。
+// TODO(zy): gnet中在什么时候调用到该函数。
+// TODO(zy): gnet.Action 是什么；怎么用这个Action？
 func (hs *httpServer) OnInitComplete(srv gnet.Server) (action gnet.Action) {
 	log.Printf("HTTP server is listening on %s (multi-cores: %t, loops: %d)\n",
 		srv.Addr.String(), srv.Multicore, srv.NumEventLoop)
 	return
 }
 
+// React - 关键函数。Reactor模式的关键所在。
 func (hs *httpServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.Action) {
 	if c.Context() != nil {
 		// bad thing happened
@@ -80,6 +91,9 @@ func (hs *httpServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.
 		action = gnet.Close
 		return
 	}
+
+	// TODO(zy): 这里仅仅是透传？需要搞懂处理流程是怎么样的。
+	// 把接收到的frame数据，直接传给下个（业务层）处理。
 	// handle the request
 	out = frame
 	return
@@ -96,6 +110,9 @@ func main() {
 
 	res = "Hello World!\r\n"
 
+	// 启动http service的必要条件：
+	// 1。http server - 用于监听端口，接收请求的连接。
+	// 2。http请求的处理 - 解析请求、处理响应。gnet源码中给的解释为：encodes and decodes TCP stream
 	http := new(httpServer)
 	hc := new(httpCodec)
 
@@ -103,12 +120,15 @@ func main() {
 	log.Fatal(gnet.Serve(http, fmt.Sprintf("tcp://:%d", port), gnet.WithMulticore(multicore), gnet.WithCodec(hc)))
 }
 
+// 这里是返回响应。
 // appendHandle handles the incoming request and appends the response to
 // the provided bytes, which is then returned to the caller.
 func appendHandle(b []byte, res string) []byte {
 	return appendResp(b, "200 OK", "", res)
 }
 
+// 拼接http response
+//
 // appendResp will append a valid http response to the provide bytes.
 // The status param should be the code plus text such as "200 OK".
 // The head parameter should be a series of lines ending with "\r\n" or empty.
@@ -134,6 +154,8 @@ func appendResp(b []byte, status, head, body string) []byte {
 	return b
 }
 
+// 高效地将 []byte 转换为 string。
+// 直接获取 []byte 的地址，然后使用 *string类型 去指向该地址，最后使用 * 操作符获取其中的string类型数据。
 func b2s(b []byte) string {
 	return *(*string)(unsafe.Pointer(&b))
 }
@@ -141,6 +163,8 @@ func b2s(b []byte) string {
 // parseReq is a very simple http request parser. This operation
 // waits for the entire payload to be buffered before returning a
 // valid request.
+//
+// data是请求的实际数据；req是需要填充获取的、构建出来的http request。
 func parseReq(data []byte, req *request) (leftover []byte, err error) {
 	sdata := b2s(data)
 	var i, s int
@@ -148,9 +172,16 @@ func parseReq(data []byte, req *request) (leftover []byte, err error) {
 	var clen int
 	q := -1
 	// method, path, proto line
+	// 在这里对http请求的第一行数据进行解析。可以获取 “请求行”：
+	//
+	// |请求方法|空格|URL|空格|协议版本|回车符|换行符|
 	for ; i < len(sdata); i++ {
+
+		// HTTP协议。每个字段之间都是以空格隔开；
 		if sdata[i] == ' ' {
+			// 遇到的第一个空格之前的字符串，标记着http method。
 			req.method = sdata[s:i]
+
 			for i, s = i+1, i+1; i < len(sdata); i++ {
 				if sdata[i] == '?' && q == -1 {
 					q = i - s
@@ -161,6 +192,7 @@ func parseReq(data []byte, req *request) (leftover []byte, err error) {
 					} else {
 						req.path = sdata[s:i]
 					}
+
 					for i, s = i+1, i+1; i < len(sdata); i++ {
 						if sdata[i] == '\n' && sdata[i-1] == '\r' {
 							req.proto = sdata[s:i]
@@ -177,6 +209,8 @@ func parseReq(data []byte, req *request) (leftover []byte, err error) {
 	if req.proto == "" {
 		return data, fmt.Errorf("malformed request")
 	}
+
+	// 解析head的部分
 	head = sdata[:s]
 	for ; i < len(sdata); i++ {
 		if i > 1 && sdata[i] == '\n' && sdata[i-1] == '\r' {
@@ -202,6 +236,7 @@ func parseReq(data []byte, req *request) (leftover []byte, err error) {
 			}
 		}
 	}
+
 	// not enough data
 	return data, nil
 }
